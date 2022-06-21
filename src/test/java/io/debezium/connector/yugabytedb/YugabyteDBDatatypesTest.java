@@ -139,6 +139,7 @@ public class YugabyteDBDatatypesTest extends AbstractConnectorTest {
         TestHelper.setContainerHostPort(ybContainer.getHost(), ybContainer.getMappedPort(5433));
         TestHelper.setMasterAddress(ybContainer.getHost() + ":" + ybContainer.getMappedPort(7100));
 
+        System.out.println("Done starting the testcontainers");
         TestHelper.dropAllSchemas();
     }
 
