@@ -458,6 +458,8 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
 
       // Helper internal variable to log GetChanges request at regular intervals.
       long lastLoggedTimeForGetChanges = System.currentTimeMillis();
+      // Stores the READ records recevied in a single GetChanges call
+      long readRecordsReceived = 0;
 
       while (context.isRunning() && retryCount <= this.connectorConfig.maxConnectorRetries()) {
         try {
@@ -491,6 +493,8 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                   continue;
                 }
 
+                // Reset for the upcoming getChanges call
+                readRecordsReceived = 0;
                 CdcSdkCheckpoint explicitCdcSdkCheckpoint = null;
                 if (taskContext.shouldEnableExplicitCheckpointing()) {
                   explicitCdcSdkCheckpoint = tabletToExplicitCheckpoint.get(part.getId());
@@ -588,6 +592,7 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                         Objects.requireNonNull(tId);
                       }
 
+                      readRecordsReceived += 1;
                       // In case of snapshots, we do not want to ignore tableUUID while updating
                       // OpId value for a table-tablet pair.
                       previousOffset.updateRecordPosition(part, lsn, lastCompletelyProcessedLsn,
@@ -615,9 +620,10 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                                           resp.getWriteId(), resp.getSnapshotTime());
                 LOGGER.debug("Final OpId for tablet {} is {}", part.getId(), finalOpId);
 
-                // If the response doesn't have any record, it is safe to assume that we should not wait
-                // for the callback to come and that we can proceed further in processing this particular tablet.
-                if (previousOffset.getSourceInfo(part).noRecordSeen()) {
+                // During the snapshot consumption phase, if the response doesn't have any record,
+                // it is safe to assume that we should not wait for the callback to come and that we
+                // can proceed further in processing this particular tablet.
+                if (IsTabletInSnapshotConsumptionState(part, previousOffset) && readRecordsReceived == 0) {
                   LOGGER.info("Should not wait for callback on tablet {}", part.getId());
                   shouldWaitForCallback.remove(part.getId());
                 }
@@ -662,9 +668,10 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                     LOGGER.info("E: Snapshot completed for tablet {} belonging to table {} ({})",
                       part.getTabletId(), table.getName(), part.getTableId());
                   } else if (isSnapshotCompleteMarker(finalOpId)) {
-                    // Add it to tablets waiting for callback so that the connector doesn't end up
-                    // calling GetChanges for the same again.
-                    if (shouldWaitForCallback.contains(part.getId())) {
+                    // Add it to tablets waiting for callback only during snapshot consumption phase so that the
+                    // connector doesn't end up calling GetChanges for the same again.
+                    if (IsTabletInSnapshotConsumptionState(part, previousOffset) &&
+                            shouldWaitForCallback.contains(part.getId())) {
                       if (!tabletsWaitingForCallback.contains(part.getId())) {
                         LOGGER.info("Adding tablet {} of table {} ({}) to wait-list",
                                     part.getId(), table.getName(), part.getTableId());
@@ -849,6 +856,21 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
     private boolean isSnapshotCompleteMarker(OpId opId) {
         return Arrays.equals(opId.getKey(), "".getBytes()) && opId.getWrite_id() == 0
                 && opId.getTime() == 0;
+    }
+
+    /**
+     * Snapshot bootstrap call can be distinguished from Snapshot consumption call based
+     * on the from_op_id sent in the GetChanges request. During snapshot bootstrap, from_op_id
+     * is equal to {@code snapshotStartLsn} i.e term & index are invalid i.e. -1.-1. But during snapshot
+     * consumption, from_op_id's term & index are greater than 0.
+     * Check if the tablet is in the snapshot consumption state.
+     * @param partition the YBPartition to obtain the current tablet's ID in the form of TableId.TabletId
+     * @param previousOffset map storing the offset (from_op_id) for a partition
+     * @return true if the tablet's from_op_id is valid, false otherwise
+     */
+    private boolean IsTabletInSnapshotConsumptionState(YBPartition partition, YugabyteDBOffsetContext previousOffset) {
+        OpId fromOpId = previousOffset.snapshotLSN(partition);
+        return (fromOpId.getTerm() > 0) && (fromOpId.getIndex() > 0);
     }
 
     protected Stream<TableId> getDataCollectionsToBeSnapshotted(Set<TableId> allDataCollections) {
