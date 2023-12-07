@@ -40,6 +40,8 @@ public class YugabyteDBSnapshotTest extends YugabytedTestBase {
     public void before() throws Exception {
         initializeConnectorTestFramework();
         TestHelper.dropAllSchemas();
+        YugabyteDBSnapshotChangeEventSource.FAIL_AFTER_SETTING_INITIAL_CHECKPOINT = false;
+        YugabyteDBSnapshotChangeEventSource.FAIL_AFTER_BOOTSTRAP_GET_CHANGES = false;
     }
 
     @AfterEach
@@ -49,6 +51,8 @@ public class YugabyteDBSnapshotTest extends YugabytedTestBase {
         TestHelper.executeDDL("drop_tables_and_databases.ddl");
         TestHelper.dropAllSchemas();
         resetCommitCallbackDelay();
+        YugabyteDBSnapshotChangeEventSource.FAIL_AFTER_SETTING_INITIAL_CHECKPOINT = false;
+        YugabyteDBSnapshotChangeEventSource.FAIL_AFTER_BOOTSTRAP_GET_CHANGES = false;
     }
 
     @AfterAll

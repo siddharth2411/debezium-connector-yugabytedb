@@ -632,7 +632,7 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                 // During the snapshot consumption phase, if the response doesn't have any record,
                 // it is safe to assume that we should not wait for the callback to come and that we
                 // can proceed further in processing this particular tablet.
-                if (IsTabletInSnapshotConsumptionState(part, previousOffset) && readRecordsReceived == 0) {
+                if (!IsTabletInSnapshotBootstrapState(part, previousOffset) && readRecordsReceived == 0) {
                   LOGGER.info("Should not wait for callback on tablet {}", part.getId());
                   shouldWaitForCallback.remove(part.getId());
                 }
@@ -679,7 +679,7 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                   } else if (isSnapshotCompleteMarker(finalOpId)) {
                     // Add it to tablets waiting for callback only during snapshot consumption phase so that the
                     // connector doesn't end up calling GetChanges for the same again.
-                    if (IsTabletInSnapshotConsumptionState(part, previousOffset) &&
+                    if (!IsTabletInSnapshotBootstrapState(part, previousOffset) &&
                             shouldWaitForCallback.contains(part.getId())) {
                       if (!tabletsWaitingForCallback.contains(part.getId())) {
                         LOGGER.info("Adding tablet {} of table {} ({}) to wait-list",
@@ -899,9 +899,9 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
      * @param previousOffset map storing the offset (from_op_id) for a partition
      * @return true if the tablet's from_op_id is valid, false otherwise
      */
-    private boolean IsTabletInSnapshotConsumptionState(YBPartition partition, YugabyteDBOffsetContext previousOffset) {
+    private boolean IsTabletInSnapshotBootstrapState(YBPartition partition, YugabyteDBOffsetContext previousOffset) {
         OpId fromOpId = previousOffset.snapshotLSN(partition);
-        return (fromOpId.getTerm() > 0) && (fromOpId.getIndex() > 0);
+        return fromOpId.equals(YugabyteDBOffsetContext.snapshotStartLsn());
     }
 
     protected Stream<TableId> getDataCollectionsToBeSnapshotted(Set<TableId> allDataCollections) {
