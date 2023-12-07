@@ -13,11 +13,8 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import io.debezium.connector.yugabytedb.connection.HashPartition;
-import io.debezium.connector.yugabytedb.util.YugabyteDBConnectorUtils;
 import io.debezium.pipeline.source.AbstractSnapshotChangeEventSource;
 
-import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,7 +73,6 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
     // end marker, but we have not received the callback from Kafka - this will ensure
     // that we do not end up sending redundant GetChanges calls.
     protected Set<String> tabletsWaitingForCallback;
-    protected List<HashPartition> partitionRanges;
 
     private boolean snapshotComplete = false;
 
@@ -114,7 +110,6 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
         this.tableIdToTable = new HashMap<>();
         this.shouldWaitForCallback = new HashSet<>();
         this.tabletsWaitingForCallback = new HashSet<>();
-        this.partitionRanges = new ArrayList<>();
     }
 
     @Override
@@ -149,9 +144,6 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
 
             LOGGER.info("Setting offsetContext/previousOffset for snapshot...");
             previousOffset = YugabyteDBOffsetContext.initialContextForSnapshot(this.connectorConfig, connection, clock, partitions);
-
-            this.partitionRanges = YugabyteDBConnectorUtils.populatePartitionRanges(
-              connectorConfig.getConfig().getString(YugabyteDBConnectorConfig.HASH_RANGES_LIST));
 
             return doExecute(context, partition, previousOffset, ctx, snapshottingTask);
         }
@@ -394,12 +386,6 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
       }
     }
 
-    protected void populateTabletPairList(List<Pair<String, String>> res) {
-      for (HashPartition hp : partitionRanges) {
-        res.add(new ImmutablePair<>(hp.getTableId(), hp.getTabletId()));
-      }
-    }
-
     protected SnapshotResult<YugabyteDBOffsetContext> doExecute(ChangeEventSourceContext context, YBPartition partition, YugabyteDBOffsetContext previousOffset,
                                                                 SnapshotContext<YBPartition, YugabyteDBOffsetContext> snapshotContext,
                                                                 SnapshottingTask snapshottingTask)
@@ -407,7 +393,14 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
       LOGGER.info("Starting the snapshot process now");
       
       // Get the list of tablets
-      List<Pair<String, String>> tableToTabletIds = HashPartition.getTableToTabletPairs(partitionRanges);
+      List<Pair<String, String>> tableToTabletIds = null;
+      try {
+        String tabletList = this.connectorConfig.getConfig().getString(YugabyteDBConnectorConfig.TABLET_LIST);
+        tableToTabletIds = (List<Pair<String, String>>) ObjectUtil.deserializeObjectFromString(tabletList);
+      } catch (Exception e) {
+        LOGGER.error("The tablet list cannot be deserialized");
+        throw new DebeziumException(e);
+      }
 
       Set<String> tableUUIDs = tableToTabletIds.stream()
                                   .map(pair -> pair.getLeft())
