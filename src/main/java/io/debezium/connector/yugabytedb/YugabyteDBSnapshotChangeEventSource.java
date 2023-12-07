@@ -13,6 +13,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import com.google.protobuf.ByteString;
 import io.debezium.pipeline.source.AbstractSnapshotChangeEventSource;
 
 import org.apache.commons.lang3.tuple.Pair;
@@ -75,6 +76,8 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
     protected Set<String> tabletsWaitingForCallback;
 
     private boolean snapshotComplete = false;
+
+  private final String LAST_SNAPSHOT_RECORD_KEY = "LAST_SNAPSHOT_RECORD";
 
     public YugabyteDBSnapshotChangeEventSource(YugabyteDBConnectorConfig connectorConfig,
                                                YugabyteDBTaskContext taskContext,
@@ -423,8 +426,8 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
         YBPartition p = new YBPartition(tableId, tabletId, true /* colocated */);
 
         GetCheckpointResponse resp = getCheckpointWithRetry(tableIdToTable.get(tableId), tabletId);
-        LOGGER.info("Checkpoint before snapshotting tablet {}: Term {} Index {} SnapshotKey: {}",
-                    tabletId, resp.getTerm(), resp.getIndex(), Arrays.toString(resp.getSnapshotKey()));
+        LOGGER.info("Checkpoint before snapshotting tablet {}: Term {} Index {} SnapshotKey: {}, time {}",
+                    tabletId, resp.getTerm(), resp.getIndex(), Arrays.toString(resp.getSnapshotKey()), resp.getSnapshotTime());
 
         OpId startLsn = OpId.from(resp);
         if (filteredTableIdToUuid.containsValue(tableId)) {
@@ -491,6 +494,8 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                   continue;
                 }
 
+                // Stores the READ records recevied in a single GetChanges call
+                long readRecordsReceived = 0;
                 CdcSdkCheckpoint explicitCdcSdkCheckpoint = null;
                 if (taskContext.shouldEnableExplicitCheckpointing()) {
                   explicitCdcSdkCheckpoint = tabletToExplicitCheckpoint.get(part.getId());
@@ -521,10 +526,13 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                 }
 
                 tabletSafeTime.put(part.getId(), resp.getResp().getSafeHybridTime());
+                OpId finalOpId = new OpId(resp.getTerm(), resp.getIndex(), resp.getKey(),
+                        resp.getWriteId(), resp.getSnapshotTime());
+                LOGGER.debug("Final OpId for tablet {} is {}", part.getId(), finalOpId);
 
                 // Process the response
-                for (CdcService.CDCSDKProtoRecordPB record :
-                        resp.getResp().getCdcSdkProtoRecordsList()) {
+                for (int idx = 0; idx < resp.getResp().getCdcSdkProtoRecordsList().size(); idx++) {
+                  CdcService.CDCSDKProtoRecordPB record = resp.getResp().getCdcSdkProtoRecordsList().get(idx);
                   CdcService.RowMessage m = record.getRowMessage();
                   YbProtoReplicationMessage message =
                     new YbProtoReplicationMessage(m, this.yugabyteDbTypeRegistry);
@@ -586,6 +594,16 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                           tId = YugabyteDBSchema.parseWithKeyspace(message.getTable(), connectorConfig.databaseName());
                         }
                         Objects.requireNonNull(tId);
+
+                        readRecordsReceived += 1;
+
+                        // if the DML record is the last snapshot record of the last snapshot batch, set all the fields
+                        // of Opid to max values and snapshot key to LAST_SNAPSHOT_RECORD.
+                        if(isSnapshotCompleteMarker(finalOpId) &&
+                                (idx == (resp.getResp().getCdcSdkProtoRecordsList().size() - 1))) {
+                          LOGGER.info("Modifying record checkpoint for last snapshot record of the last snapshot batch");
+                          setIdentificationMarkerForLastSnapshotRecord(lsn);
+                        }
                       }
 
                       // In case of snapshots, we do not want to ignore tableUUID while updating
@@ -611,13 +629,10 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                   }
                 }
 
-                OpId finalOpId = new OpId(resp.getTerm(), resp.getIndex(), resp.getKey(),
-                                          resp.getWriteId(), resp.getSnapshotTime());
-                LOGGER.debug("Final OpId for tablet {} is {}", part.getId(), finalOpId);
-
-                // If the response doesn't have any record, it is safe to assume that we should not wait
-                // for the callback to come and that we can proceed further in processing this particular tablet.
-                if (previousOffset.getSourceInfo(part).noRecordSeen()) {
+                // During the snapshot consumption phase, if the response doesn't have any record,
+                // it is safe to assume that we should not wait for the callback to come and that we
+                // can proceed further in processing this particular tablet.
+                if (IsTabletInSnapshotConsumptionState(part, previousOffset) && readRecordsReceived == 0) {
                   LOGGER.info("Should not wait for callback on tablet {}", part.getId());
                   shouldWaitForCallback.remove(part.getId());
                 }
@@ -662,9 +677,10 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
                     LOGGER.info("E: Snapshot completed for tablet {} belonging to table {} ({})",
                       part.getTabletId(), table.getName(), part.getTableId());
                   } else if (isSnapshotCompleteMarker(finalOpId)) {
-                    // Add it to tablets waiting for callback so that the connector doesn't end up
-                    // calling GetChanges for the same again.
-                    if (shouldWaitForCallback.contains(part.getId())) {
+                    // Add it to tablets waiting for callback only during snapshot consumption phase so that the
+                    // connector doesn't end up calling GetChanges for the same again.
+                    if (IsTabletInSnapshotConsumptionState(part, previousOffset) &&
+                            shouldWaitForCallback.contains(part.getId())) {
                       if (!tabletsWaitingForCallback.contains(part.getId())) {
                         LOGGER.info("Adding tablet {} of table {} ({}) to wait-list",
                                     part.getId(), table.getName(), part.getTableId());
@@ -756,7 +772,7 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
       }
 
       OpId opId = OpId.from(this.tabletToExplicitCheckpoint.get(partition.getId()));
-      if (isSnapshotCompleteMarker(opId)) {
+      if (IsLastSnapshotRecordOfLastBatch(opId)) {
         LOGGER.info("Adding tablet {} to snapshot completed list", partition.getId());
         snapshotCompletedTablets.add(partition.getId());
         markSnapshotDoneOnServer(partition, offsetContext);
@@ -796,6 +812,28 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
       }
     }
 
+  }
+
+  /**
+   * Last snapshot record of the last snapshot batch will have a unique marker that can be used for indentification.
+   * Set all the fields of the record's Checkpoint to max values and snapshot key to LAST_SNAPSHOT_RECORD.
+   * @param recordCheckpoint the record's checkpoint of the last snpashot record
+   */
+  private void setIdentificationMarkerForLastSnapshotRecord(OpId recordCheckpoint) {
+      recordCheckpoint.setTerm(Long.MAX_VALUE);
+      recordCheckpoint.setIndex(Long.MAX_VALUE);
+      recordCheckpoint.setKey(LAST_SNAPSHOT_RECORD_KEY);
+      recordCheckpoint.setWriteId(Integer.MAX_VALUE);
+      recordCheckpoint.setTime(Long.MAX_VALUE);
+  }
+
+  private Boolean IsLastSnapshotRecordOfLastBatch(OpId opid) {
+    String snapshotKey = ByteString.copyFrom(opid.getKey()).toStringUtf8();
+    return (opid.getTerm() == Long.MAX_VALUE) &&
+            (opid.getIndex() == Long.MAX_VALUE) &&
+            (opid.getWrite_id() == Integer.MAX_VALUE) &&
+            (opid.getTime() == Long.MAX_VALUE) &&
+            (snapshotKey.equals(LAST_SNAPSHOT_RECORD_KEY));
   }
 
     /**
@@ -849,6 +887,21 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
     private boolean isSnapshotCompleteMarker(OpId opId) {
         return Arrays.equals(opId.getKey(), "".getBytes()) && opId.getWrite_id() == 0
                 && opId.getTime() == 0;
+    }
+
+    /**
+     * Snapshot bootstrap call can be distinguished from Snapshot consumption call based
+     * on the from_op_id sent in the GetChanges request. During snapshot bootstrap, from_op_id
+     * is equal to {@code snapshotStartLsn} i.e term & index are invalid i.e. -1.-1. But during snapshot
+     * consumption, from_op_id's term & index are greater than 0.
+     * Check if the tablet is in the snapshot consumption state.
+     * @param partition the YBPartition to obtain the current tablet's ID in the form of TableId.TabletId
+     * @param previousOffset map storing the offset (from_op_id) for a partition
+     * @return true if the tablet's from_op_id is valid, false otherwise
+     */
+    private boolean IsTabletInSnapshotConsumptionState(YBPartition partition, YugabyteDBOffsetContext previousOffset) {
+        OpId fromOpId = previousOffset.snapshotLSN(partition);
+        return (fromOpId.getTerm() > 0) && (fromOpId.getIndex() > 0);
     }
 
     protected Stream<TableId> getDataCollectionsToBeSnapshotted(Set<TableId> allDataCollections) {
