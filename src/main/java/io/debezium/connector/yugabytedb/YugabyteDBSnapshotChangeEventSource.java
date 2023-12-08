@@ -496,8 +496,21 @@ public class YugabyteDBSnapshotChangeEventSource extends AbstractSnapshotChangeE
 
                 // Stores the READ records recevied in a single GetChanges call
                 long readRecordsReceived = 0;
+
                 CdcSdkCheckpoint explicitCdcSdkCheckpoint = null;
                 if (taskContext.shouldEnableExplicitCheckpointing()) {
+                  CdcSdkCheckpoint checkpoint = tabletToExplicitCheckpoint.get(part.getId());
+
+                  // If the checkpoint in tabletToExplicitCheckpoint map corresponds to the last record's checkpoint
+                  // of last snapshot batch, it means kafka has consumed the last record of last batch. So, we should
+                  // not poll on this tablet anymore, instead mark snapshot done for this tablet.
+                  if(IsLastSnapshotRecordOfLastBatch(OpId.from(checkpoint))) {
+                    LOGGER.info("Received last snapshot record's checkpoint. Adding {} to the list of snapshot completed tablets", part.getId());
+                    snapshotCompletedTablets.add(part.getId());
+                    markSnapshotDoneOnServer(part, previousOffset);
+                    tabletsWaitingForCallback.removeIf(t -> t.equals(part.getId()));
+                    continue;
+                  }
                   explicitCdcSdkCheckpoint = tabletToExplicitCheckpoint.get(part.getId());
                 }
 
